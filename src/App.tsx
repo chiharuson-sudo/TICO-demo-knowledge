@@ -2,6 +2,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 // @ts-expect-error d3-sankey has no type definitions
 import { sankey, sankeyLinkHorizontal } from "d3-sankey";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  ComposedChart,
+  Line,
+  AreaChart,
+  Area,
+  PieChart,
+  Pie,
+  Cell,
+} from "recharts";
 
 // ========== 型定義 ==========
 type Perspective =
@@ -25,6 +42,8 @@ type KnowledgeNode = {
   domain: TechDomain;
   source: string;
   customerLayers: CustomerLayer[];
+  sourceDate: string;
+  sourceType: string;
 };
 
 type RelationshipEdge = {
@@ -32,6 +51,42 @@ type RelationshipEdge = {
   to: string;
   type: "因果" | "前提" | "波及" | "対策";
   description: string;
+};
+
+// source から会議名と日付を抽出
+function parseSource(source: string): { name: string; date: string } {
+  const match = source.match(/^(.+)-(\d{8})$/);
+  if (!match) return { name: source, date: "unknown" };
+  const [, name, dateStr] = match;
+  return {
+    name: name ?? source,
+    date: `${dateStr.slice(0, 4)}-${dateStr.slice(4, 6)}-${dateStr.slice(6, 8)}`,
+  };
+}
+
+function initNodes(rawNodes: Omit<KnowledgeNode, "sourceDate" | "sourceType">[]): KnowledgeNode[] {
+  return rawNodes.map((n) => {
+    const parsed = parseSource(n.source);
+    return { ...n, sourceDate: parsed.date, sourceType: parsed.name };
+  });
+}
+
+// ダッシュボード用フィルタ型
+type DashboardFilters = {
+  product: string;
+  domain: string;
+  source: string;
+  dateRange: { from: string; to: string };
+  perspective: string;
+};
+
+// 関係マトリクス用セル型
+type MatrixCell = {
+  from: string;
+  to: string;
+  count: number;
+  types: { type: string; count: number }[];
+  edges: RelationshipEdge[];
 };
 
 // ========== カラー ==========
@@ -75,7 +130,7 @@ const layerColors: Record<CustomerLayer, string> = {
 };
 
 // ========== ノード一覧（45件） ==========
-const NODES: KnowledgeNode[] = [
+const RAW_NODES: Omit<KnowledgeNode, "sourceDate" | "sourceType">[] = [
   { id: "K1", title: "AD変換：ポート安定待ち時間等の考慮が必須", perspective: "③技術的注意点", product: "コンバータ", domain: "電力変換", source: "設計チェック-20251104", customerLayers: ["設計・製造の因果関係"] },
   { id: "K2", title: "AD変換異常時：タイムアウト異常対応が仕様書で定義", perspective: "①判断ルール", product: "コンバータ", domain: "電力変換", source: "設計チェック-20251104", customerLayers: ["評価基準"] },
   { id: "K3", title: "AD変換結果取得は変換完了フラグ確認後に実施", perspective: "②社内ルール", product: "コンバータ", domain: "電力変換", source: "設計チェック-20251104", customerLayers: ["設計チェックリスト"] },
@@ -122,6 +177,7 @@ const NODES: KnowledgeNode[] = [
   { id: "K44", title: "NG品試験時は必ず組長・課長に相談", perspective: "②社内ルール", product: "共通", domain: "回路/実装", source: "スタッフ週報-20250729", customerLayers: ["設計チェックリスト"] },
   { id: "K45", title: "断面観察指示書は正式シートのみ使用", perspective: "②社内ルール", product: "共通", domain: "回路/実装", source: "スタッフ週報-20250729", customerLayers: ["設計チェックリスト"] },
 ];
+const NODES = initNodes(RAW_NODES);
 
 // ========== エッジ一覧（21件） ==========
 const EDGES: RelationshipEdge[] = [
@@ -181,6 +237,37 @@ const PRODUCTS = ["全て", "コンバータ", "充電器", "共通"];
 const REL_TYPES = ["因果", "前提", "波及", "対策"] as const;
 
 // ========== タブ1: ナレッジグラフ ==========
+const MONTH_OPTIONS = ["2025-07", "2025-08", "2025-09", "2025-10", "2025-11", "2025-12", "2026-01"];
+
+function TimeSliderPlayButton({ timeSliderMax, setTimeSliderMax }: { timeSliderMax: string; setTimeSliderMax: (s: string) => void }) {
+  const [playing, setPlaying] = useState(false);
+  const idxRef = useRef(MONTH_OPTIONS.indexOf(timeSliderMax));
+  idxRef.current = MONTH_OPTIONS.indexOf(timeSliderMax);
+  useEffect(() => {
+    if (!playing) return;
+    const t = setInterval(() => {
+      const i = idxRef.current;
+      if (i >= MONTH_OPTIONS.length - 1) {
+        setPlaying(false);
+        return;
+      }
+      const next = MONTH_OPTIONS[i + 1];
+      idxRef.current = i + 1;
+      setTimeSliderMax(next);
+    }, 500);
+    return () => clearInterval(t);
+  }, [playing, setTimeSliderMax]);
+  return (
+    <button
+      type="button"
+      onClick={() => setPlaying(p => !p)}
+      className="px-2 py-1 rounded text-[13px] bg-[#334155] text-[#F1F5F9] hover:bg-[#475569]"
+    >
+      {playing ? "停止" : "再生"}
+    </button>
+  );
+}
+
 function KnowledgeGraphTab({
   filterPerspectives,
   filterDomain,
@@ -192,6 +279,10 @@ function KnowledgeGraphTab({
   setFilterRelTypes,
   selectedId,
   onSelectNode,
+  timeSliderMax,
+  setTimeSliderMax,
+  highlightedNodeIds,
+  setHighlightedNodeIds,
 }: {
   filterPerspectives: Set<Perspective>;
   filterDomain: string;
@@ -203,6 +294,10 @@ function KnowledgeGraphTab({
   setFilterRelTypes: (s: Set<string>) => void;
   selectedId: string | null;
   onSelectNode: (id: string | null) => void;
+  timeSliderMax: string;
+  setTimeSliderMax: (s: string) => void;
+  highlightedNodeIds: string[];
+  setHighlightedNodeIds: (ids: string[]) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -216,6 +311,7 @@ function KnowledgeGraphTab({
       if (filterPerspectives.size && !filterPerspectives.has(n.perspective)) return false;
       if (filterDomain !== "全て" && n.domain !== filterDomain) return false;
       if (filterProduct !== "全て" && n.product !== filterProduct) return false;
+      if (n.sourceDate && n.sourceDate.slice(0, 7) > timeSliderMax) return false;
       return true;
     }).map(n => n.id));
     const edges = EDGES.filter(e => {
@@ -227,7 +323,7 @@ function KnowledgeGraphTab({
     edges.forEach(e => { keepIds.add(e.from); keepIds.add(e.to); });
     const nodes = NODES.filter(n => keepIds.has(n.id));
     return { nodes, edges };
-  }, [filterPerspectives, filterDomain, filterProduct, filterRelTypes]);
+  }, [filterPerspectives, filterDomain, filterProduct, filterRelTypes, timeSliderMax]);
 
   const degree = useMemo(() => {
     const d: Record<string, number> = {};
@@ -278,6 +374,7 @@ function KnowledgeGraphTab({
   }, [filtered.nodes, filtered.edges, degree, scaleDeg]);
 
   useEffect(() => {
+    const highlightSet = new Set(highlightedNodeIds);
     const init = initSim();
     if (!init) return;
     let { nodes, links, width, height } = init;
@@ -297,7 +394,8 @@ function KnowledgeGraphTab({
       .attr("stroke", d => edgeStyles[d.type].color)
       .attr("stroke-width", 1.5)
       .attr("stroke-dasharray", d => edgeStyles[d.type].dash ?? "none")
-      .attr("marker-end", d => `url(#arrow-${d.type})`);
+      .attr("marker-end", d => `url(#arrow-${d.type})`)
+      .attr("opacity", d => (highlightSet.size ? ((highlightSet.has((d.source as D3Node).id) && highlightSet.has((d.target as D3Node).id)) ? 1 : 0.2) : 1));
     const defs = svg.append("defs");
     REL_TYPES.forEach(t => {
       defs.append("marker").attr("id", `arrow-${t}`).attr("viewBox", "0 -5 10 10").attr("refX", 12).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto")
@@ -305,12 +403,12 @@ function KnowledgeGraphTab({
     });
     defs.append("marker").attr("id", "arrow").attr("viewBox", "0 -5 10 10").attr("refX", 12).attr("refY", 0).attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto")
       .append("path").attr("fill", colors.textSecondary).attr("d", "M0,-5L10,0L0,5Z");
-
     const node = nodeG.selectAll("circle").data(nodes).join("circle")
       .attr("r", d => d.radius)
       .attr("fill", d => perspectiveColors[d.perspective])
-      .attr("stroke", colors.surface)
-      .attr("stroke-width", 1.5)
+      .attr("stroke", d => (highlightSet.size && highlightSet.has(d.id) ? "#F1F5F9" : colors.surface))
+      .attr("stroke-width", d => (highlightSet.size && highlightSet.has(d.id) ? 3 : 1.5))
+      .attr("opacity", d => (highlightSet.size ? (highlightSet.has(d.id) ? 1 : 0.35) : 1))
       .style("cursor", "pointer")
       .call(d3.drag<SVGCircleElement, D3Node>()
         .on("start", (ev) => { ev.sourceEvent.stopPropagation(); if (!simRef.current) return; simRef.current.alphaTarget(0.3).restart(); })
@@ -324,7 +422,8 @@ function KnowledgeGraphTab({
       .attr("text-anchor", "middle")
       .attr("dy", d => d.radius + 14)
       .text(d => d.title.length > 20 ? d.title.slice(0, 20) + "…" : d.title)
-      .attr("pointer-events", "none");
+      .attr("pointer-events", "none")
+      .attr("opacity", d => (highlightSet.size ? (highlightSet.has(d.id) ? 1 : 0.35) : 1));
 
     const zoom = d3.zoom<SVGSVGElement, unknown>().scaleExtent([0.3, 4]).on("zoom", (ev) => {
       g.attr("transform", ev.transform);
@@ -363,10 +462,10 @@ function KnowledgeGraphTab({
       onSelectNode(d.id);
     });
 
-    svg.on("click", () => onSelectNode(null));
+    svg.on("click", () => { onSelectNode(null); setHighlightedNodeIds([]); });
 
     return () => { simRef.current?.stop(); };
-  }, [filtered.nodes.length, filtered.edges.length, initSim, onSelectNode]);
+  }, [filtered.nodes.length, filtered.edges.length, initSim, onSelectNode, highlightedNodeIds, setHighlightedNodeIds]);
 
   const selected = selectedId ? NODES.find(n => n.id === selectedId) : null;
   const selectedEdges = selectedId ? EDGES.filter(e => e.from === selectedId || e.to === selectedId) : [];
@@ -418,6 +517,17 @@ function KnowledgeGraphTab({
             {t}
           </button>
         ))}
+        <span className="text-[#94A3B8] text-[13px] ml-4">時間軸:</span>
+        <select
+          value={timeSliderMax}
+          onChange={e => setTimeSliderMax(e.target.value)}
+          className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]"
+        >
+          {MONTH_OPTIONS.map(m => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+        <TimeSliderPlayButton timeSliderMax={timeSliderMax} setTimeSliderMax={setTimeSliderMax} />
       </div>
       <div className="flex flex-1 min-h-0">
         <div ref={containerRef} className="flex-[0_0_70%] relative border-r border-[#334155] min-h-[480px]" style={{ minHeight: "60vh" }}>
@@ -646,118 +756,561 @@ function OntologyMappingTab() {
   );
 }
 
-// ========== タブ3: 抽出統計 ==========
-function StatsTab() {
-  const perspectiveCounts = useMemo(() => {
-    const m: Record<string, number> = {};
-    NODES.forEach(n => { m[n.perspective] = (m[n.perspective] ?? 0) + 1; });
-    return PERSPECTIVES.map(p => ({ name: p, count: m[p] ?? 0 }));
-  }, []);
-  const domainCounts = useMemo(() => {
-    const m: Record<string, number> = {};
-    NODES.forEach(n => { m[n.domain] = (m[n.domain] ?? 0) + 1; });
-    return DOMAINS.map(d => ({ name: d, count: m[d] ?? 0 }));
-  }, []);
-  const relCounts = useMemo(() => {
-    const m: Record<string, number> = {};
-    EDGES.forEach(e => { m[e.type] = (m[e.type] ?? 0) + 1; });
-    return REL_TYPES.map(t => ({ name: t, count: m[t] ?? 0 }));
-  }, []);
-  const maxP = Math.max(...perspectiveCounts.map(p => p.count), 1);
-  const maxR = Math.max(...relCounts.map(r => r.count), 1);
+// ========== タブ3: 集計ダッシュボード ==========
+const SOURCE_OPTIONS = (() => {
+  const set = new Map<string, string>();
+  NODES.forEach(n => {
+    const d = parseSource(n.source).date;
+    set.set(n.source, d);
+  });
+  return ["全て", ...Array.from(set.keys()).sort((a, b) => (set.get(a) ?? "").localeCompare(set.get(b) ?? ""))];
+})();
+
+function DashboardTab({
+  filters,
+  setFilters,
+  onHeatmapCellClick,
+}: {
+  filters: DashboardFilters;
+  setFilters: (f: DashboardFilters) => void;
+  onHeatmapCellClick: (nodeIds: string[]) => void;
+}) {
+  const filteredNodes = useMemo(() => {
+    return NODES.filter(n => {
+      if (filters.product !== "全て" && n.product !== filters.product) return false;
+      if (filters.domain !== "全て" && n.domain !== filters.domain) return false;
+      if (filters.source !== "全て" && n.source !== filters.source) return false;
+      const ym = n.sourceDate.slice(0, 7);
+      if (ym < filters.dateRange.from || ym > filters.dateRange.to) return false;
+      if (filters.perspective !== "全て" && n.perspective !== filters.perspective) return false;
+      return true;
+    });
+  }, [filters]);
+
+  const productPerspectiveCross = useMemo(() => {
+    const products = ["コンバータ", "充電器", "共通"];
+    return products.map(product => {
+      const byP: Record<string, number> = {};
+      PERSPECTIVES.forEach(p => { byP[p] = 0; });
+      filteredNodes.filter(n => n.product === product).forEach(n => { byP[n.perspective] = (byP[n.perspective] ?? 0) + 1; });
+      return { product, ...byP } as { product: string } & Record<string, number>;
+    });
+  }, [filteredNodes]);
+
+  const sourceCounts = useMemo(() => {
+    const m: Record<string, Record<string, number>> = {};
+    filteredNodes.forEach(n => {
+      if (!m[n.source]) { m[n.source] = {}; PERSPECTIVES.forEach(p => { m[n.source][p] = 0; }); }
+      m[n.source][n.perspective] = (m[n.source][n.perspective] ?? 0) + 1;
+    });
+    const sources = Object.keys(m).sort((a, b) => parseSource(a).date.localeCompare(parseSource(b).date));
+    return sources.map(source => {
+      const byP = m[source];
+      return { source: source.replace(/-(\d{8})$/, " ($1)"), ...byP, total: Object.values(byP).reduce((a, b) => a + b, 0) };
+    });
+  }, [filteredNodes]);
+
+  const domainPerspectiveHeatmap = useMemo(() => {
+    const rows = DOMAINS.map(domain =>
+      PERSPECTIVES.map(perspective => {
+        const count = filteredNodes.filter(n => n.domain === domain && n.perspective === perspective).length;
+        const nodeIds = filteredNodes.filter(n => n.domain === domain && n.perspective === perspective).map(n => n.id);
+        return { domain, perspective, count, nodeIds };
+      })
+    );
+    return rows.flat();
+  }, [filteredNodes]);
+
+  const timeSeriesData = useMemo(() => {
+    const months = MONTH_OPTIONS;
+    return months.map(month => {
+      const nodesUpToMonth = filteredNodes.filter(n => n.sourceDate.slice(0, 7) <= month);
+      const byPerspective: Record<string, number> = {};
+      PERSPECTIVES.forEach(p => { byPerspective[p] = nodesUpToMonth.filter(n => n.perspective === p).length; });
+      return { month, total: nodesUpToMonth.length, ...byPerspective };
+    });
+  }, [filteredNodes]);
+
+  const barStackData = useMemo(() => {
+    return productPerspectiveCross.map((row: { product: string } & Record<string, number>) => {
+      const rest: Record<string, number> = {};
+      PERSPECTIVES.forEach(p => { rest[p] = row[p] ?? 0; });
+      return { name: row.product, ...rest };
+    });
+  }, [productPerspectiveCross]);
+
+  const heatmapMax = Math.max(...domainPerspectiveHeatmap.map(c => c.count), 1);
+
+  const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: { name: string; value: number; color: string }[]; label?: string }) => {
+    if (!active || !payload?.length) return null;
+    return (
+      <div className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1.5 text-[12px] shadow-lg">
+        <div className="text-[#F1F5F9] font-medium mb-1">{label}</div>
+        {payload.map(p => p.value > 0 && <div key={p.name} style={{ color: p.color }}>{p.name}: {p.value}件</div>)}
+      </div>
+    );
+  };
 
   return (
-    <div className="p-6 space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4">
-          <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">観点分布</h3>
-          <div className="space-y-2">
-            {perspectiveCounts.map(p => (
-              <div key={p.name} className="flex items-center gap-2">
-                <span className="w-[80px] text-[12px] text-[#94A3B8] truncate">{p.name}</span>
-                <div className="flex-1 h-5 bg-[#334155] rounded overflow-hidden">
-                  <div className="h-full rounded transition-all" style={{ width: `${(p.count / maxP) * 100}%`, backgroundColor: perspectiveColors[p.name as Perspective] }} />
-                </div>
-                <span className="text-[#F1F5F9] text-[12px] w-6 text-right">{p.count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4">
-          <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">技術ドメイン分布</h3>
-          <svg width="240" height="240" className="mx-auto">
-            {(() => {
-              const total = domainCounts.reduce((a, b) => a + b.count, 0);
-              if (total === 0) return null;
-              let acc = 0;
-              const domainChartColors = ["#3B82F6", "#10B981", "#8B5CF6", "#F59E0B", "#EC4899"];
-              return domainCounts.map((d, i) => {
-                const ratio = d.count / total;
-                const start = acc;
-                acc += ratio;
-                const a0 = start * 2 * Math.PI - Math.PI / 2;
-                const a1 = acc * 2 * Math.PI - Math.PI / 2;
-                const r0 = 70; const r1 = 100;
-                const x0 = 120 + r0 * Math.cos(a0); const y0 = 120 + r0 * Math.sin(a0);
-                const x1 = 120 + r1 * Math.cos(a0); const y1 = 120 + r1 * Math.sin(a0);
-                const x2 = 120 + r1 * Math.cos(a1); const y2 = 120 + r1 * Math.sin(a1);
-                const x3 = 120 + r0 * Math.cos(a1); const y3 = 120 + r0 * Math.sin(a1);
-                const large = ratio > 0.5 ? 1 : 0;
-                const path = `M ${x0} ${y0} L ${x1} ${y1} A ${r1} ${r1} 0 ${large} 1 ${x2} ${y2} L ${x3} ${y3} A ${r0} ${r0} 0 ${large} 0 ${x0} ${y0}`;
-                return <path key={d.name} d={path} fill={domainChartColors[i % domainChartColors.length]} stroke={colors.bg} strokeWidth={2} />;
-              });
-            })()}
-            <circle cx="120" cy="120" r="65" fill={colors.bg} />
-            <text x="120" y="118" textAnchor="middle" fill={colors.textPrimary} fontSize={14}>ドメイン</text>
-          </svg>
-          <div className="flex flex-wrap justify-center gap-3 mt-2 text-[12px]">
-            {domainCounts.map((d, i) => (
-              <span key={d.name} className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: ["#3B82F6", "#10B981", "#8B5CF6", "#F59E0B", "#EC4899"][i % 5] }} />
-                {d.name} {d.count}
-              </span>
-            ))}
-          </div>
-        </div>
-        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4">
-          <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">関係種別分布</h3>
-          <div className="space-y-2">
-            {relCounts.map(r => (
-              <div key={r.name} className="flex items-center gap-2">
-                <span className="w-16 text-[12px] text-[#94A3B8]">{r.name}</span>
-                <div className="flex-1 h-5 bg-[#334155] rounded overflow-hidden">
-                  <div className="h-full rounded" style={{ width: `${(r.count / maxR) * 100}%`, backgroundColor: edgeStyles[r.name as keyof typeof edgeStyles].color }} />
-                </div>
-                <span className="text-[#F1F5F9] text-[12px] w-6 text-right">{r.count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4">
-          <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">データソースサマリー</h3>
-          <ul className="text-[13px] text-[#94A3B8] space-y-1">
-            <li>入力VTT: 8件</li>
-            <li>ナレッジ: 45件</li>
-            <li>関係: 21件</li>
-            <li>ドメイン: 5領域</li>
-          </ul>
-        </div>
+    <div className="flex flex-col h-full p-4">
+      <div className="flex flex-wrap items-center gap-3 px-4 py-3 rounded-lg bg-[#1E293B] border border-[#334155] mb-4">
+        <span className="text-[#94A3B8] text-[13px]">製品:</span>
+        <select value={filters.product} onChange={e => setFilters({ ...filters, product: e.target.value })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          {PRODUCTS.map(p => <option key={p} value={p}>{p}</option>)}
+        </select>
+        <span className="text-[#94A3B8] text-[13px]">ドメイン:</span>
+        <select value={filters.domain} onChange={e => setFilters({ ...filters, domain: e.target.value })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          <option value="全て">全て</option>
+          {DOMAINS.map(d => <option key={d} value={d}>{d}</option>)}
+        </select>
+        <span className="text-[#94A3B8] text-[13px]">ソース:</span>
+        <select value={filters.source} onChange={e => setFilters({ ...filters, source: e.target.value })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9] max-w-[200px]">
+          {SOURCE_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <span className="text-[#94A3B8] text-[13px]">期間:</span>
+        <select value={filters.dateRange.from} onChange={e => setFilters({ ...filters, dateRange: { ...filters.dateRange, from: e.target.value } })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          {MONTH_OPTIONS.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <span className="text-[#94A3B8]">〜</span>
+        <select value={filters.dateRange.to} onChange={e => setFilters({ ...filters, dateRange: { ...filters.dateRange, to: e.target.value } })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          {MONTH_OPTIONS.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <span className="text-[#94A3B8] text-[13px]">観点:</span>
+        <select value={filters.perspective} onChange={e => setFilters({ ...filters, perspective: e.target.value })} className="bg-[#0F172A] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          <option value="全て">全て</option>
+          {PERSPECTIVES.map(p => <option key={p} value={p}>{p}</option>)}
+        </select>
       </div>
-      <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4 text-[13px] text-[#94A3B8] leading-relaxed">
-        現在は設計チェックシート読み合わせ会を中心に8件のVTTから抽出しています。設計レビュー会・DR会議・不具合検討会のVTTを追加することで、⑥前提条件・⑦検討漏れ・⑨影響範囲の抽出が増加し、御社オントロジーの「故障モード・故障原因」「横展開・波及リスク」層がさらに充実します。
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 flex-1 min-h-0">
+        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4 min-h-[280px]">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">製品別 × 観点（積み上げ）</h3>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={barStackData} margin={{ top: 8, right: 8, left: 8, bottom: 24 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
+              <XAxis dataKey="name" tick={{ fill: colors.textSecondary, fontSize: 11 }} />
+              <YAxis tick={{ fill: colors.textSecondary, fontSize: 11 }} />
+              <Tooltip content={<CustomTooltip />} />
+              {PERSPECTIVES.map(p => (
+                <Bar key={p} dataKey={p} stackId="a" fill={perspectiveColors[p]} name={p} radius={[0, 0, 0, 0]} />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4 min-h-[280px] overflow-hidden">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">ソース会議別件数</h3>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={sourceCounts} layout="vertical" margin={{ top: 8, right: 8, left: 100, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
+              <XAxis type="number" tick={{ fill: colors.textSecondary, fontSize: 11 }} />
+              <YAxis type="category" dataKey="source" width={95} tick={{ fill: colors.textSecondary, fontSize: 10 }} />
+              <Tooltip content={<CustomTooltip />} />
+              {PERSPECTIVES.map(p => (
+                <Bar key={p} dataKey={p} stackId="b" fill={perspectiveColors[p]} name={p} radius={[0, 0, 0, 0]} />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4 min-h-[280px] overflow-x-auto">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">技術ドメイン × 観点 ヒートマップ（クリックでタブ1でハイライト）</h3>
+          <DomainPerspectiveHeatmapSVG data={domainPerspectiveHeatmap} max={heatmapMax} onCellClick={onHeatmapCellClick} />
+        </div>
+
+        <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4 min-h-[280px]">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">時間軸トレンド（累積）</h3>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart data={timeSeriesData} margin={{ top: 8, right: 8, left: 8, bottom: 24 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
+              <XAxis dataKey="month" tick={{ fill: colors.textSecondary, fontSize: 11 }} />
+              <YAxis tick={{ fill: colors.textSecondary, fontSize: 11 }} />
+              <Tooltip content={<CustomTooltip />} />
+              <Legend />
+              <Line type="monotone" dataKey="total" stroke="#F1F5F9" strokeWidth={2} name="全体" dot={{ fill: colors.bg }} />
+              {PERSPECTIVES.map(p => (
+                <Line key={p} type="monotone" dataKey={p} stroke={perspectiveColors[p]} strokeWidth={1} name={p} dot={false} />
+              ))}
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
       </div>
     </div>
   );
 }
 
+function DomainPerspectiveHeatmapSVG({ data, max, onCellClick }: { data: { domain: string; perspective: string; count: number; nodeIds: string[] }[]; max: number; onCellClick: (nodeIds: string[]) => void }) {
+  const cellW = 44;
+  const cellH = 22;
+  const labelW = 100;
+  const headerH = 24;
+  const rows = DOMAINS;
+  const cols = PERSPECTIVES;
+
+  return (
+    <svg width={labelW + cols.length * cellW} height={headerH + rows.length * cellH} className="min-w-0">
+      {cols.map((p, ci) => (
+        <text key={p} x={labelW + ci * cellW + cellW / 2} y={headerH - 6} textAnchor="middle" fill={colors.textSecondary} fontSize={9}>{p.replace(/[①②③④⑤⑥⑦⑧⑨]/g, "")}</text>
+      ))}
+      {rows.map((r, ri) => (
+        <text key={r} x={labelW - 4} y={headerH + ri * cellH + cellH / 2 + 4} textAnchor="end" fill={colors.textSecondary} fontSize={9}>{r}</text>
+      ))}
+      {data.map((cell) => {
+        const ri = rows.indexOf(cell.domain as TechDomain);
+        const ci = cols.indexOf(cell.perspective as Perspective);
+        if (ri < 0 || ci < 0) return null;
+        const opacity = cell.count === 0 ? 0 : Math.min(1, 0.3 + (cell.count / max) * 0.7);
+        const fill = cell.count === 0 ? colors.bg : (perspectiveColors[cell.perspective as Perspective] ?? colors.surface);
+        return (
+          <g key={`${cell.domain}-${cell.perspective}`}>
+            <rect
+              x={labelW + ci * cellW + 1}
+              y={headerH + ri * cellH + 1}
+              width={cellW - 2}
+              height={cellH - 2}
+              fill={fill}
+              fillOpacity={cell.count === 0 ? 1 : opacity}
+              stroke={colors.border}
+              style={{ cursor: "pointer" }}
+              onMouseOver={e => { e.currentTarget.setAttribute("stroke", "#F1F5F9"); e.currentTarget.setAttribute("stroke-width", "2"); }}
+              onMouseOut={e => { e.currentTarget.setAttribute("stroke", colors.border); e.currentTarget.setAttribute("stroke-width", "1"); }}
+              onClick={() => cell.nodeIds.length && onCellClick(cell.nodeIds)}
+            />
+            {cell.count > 0 && (
+              <text x={labelW + ci * cellW + cellW / 2} y={headerH + ri * cellH + cellH / 2 + 4} textAnchor="middle" fill={colors.textPrimary} fontSize={10}>{cell.count}</text>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ========== タブ4: 蓄積トレンド ==========
+const LAYER_NAMES = ["参考書・教科書", "設計計算書・失敗事例", "客先の意向", "トレンド"] as const;
+const LAYER_COLORS_TAB4 = ["#60A5FA", "#34D399", "#C084FC", "#F59E0B"];
+const KPI_TARGET = 50;
+
+function AccumulationTrendTab() {
+  const sourcesByDate = useMemo(() => {
+    const set = new Map<string, { date: string; name: string }>();
+    NODES.forEach(n => {
+      const p = parseSource(n.source);
+      if (!set.has(n.source)) set.set(n.source, { date: p.date, name: p.name });
+    });
+    return Array.from(set.entries())
+      .map(([, v]) => v)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }, []);
+
+  const layerGrowth = useMemo(() => {
+    return sourcesByDate.map(source => {
+      const nodesUpTo = NODES.filter(n => parseSource(n.source).date <= source.date);
+      const refBook = nodesUpTo.filter(n => n.customerLayers.includes("設計・製造の因果関係")).length;
+      const designFail = nodesUpTo.filter(n =>
+        n.customerLayers.some(l => ["対策・設計ノウハウ", "設計チェックリスト", "故障モード・故障原因"].includes(l))
+      ).length;
+      const customer = nodesUpTo.filter(n =>
+        n.customerLayers.includes("横展開・波及リスク") ||
+        n.perspective === "⑨影響範囲" ||
+        (n.title.includes("客先") || n.title.includes("合意"))
+      ).length;
+      const trend = nodesUpTo.filter(n =>
+        n.perspective === "⑦検討漏れ" ||
+        n.perspective === "⑥前提条件" ||
+        n.title.includes("サイバーセキュリティ")
+      ).length;
+      return {
+        date: source.date,
+        sourceName: source.name,
+        "参考書・教科書": refBook,
+        "設計計算書・失敗事例": designFail,
+        "客先の意向": customer,
+        "トレンド": trend,
+      };
+    });
+  }, [sourcesByDate]);
+
+  const coveragePct = useMemo(() => {
+    const last = layerGrowth[layerGrowth.length - 1];
+    if (!last) return { "参考書・教科書": 0, "設計計算書・失敗事例": 0, "客先の意向": 0, "トレンド": 0 };
+    return {
+      "参考書・教科書": Math.min(100, Math.round(((last["参考書・教科書"] ?? 0) / KPI_TARGET) * 100)),
+      "設計計算書・失敗事例": Math.min(100, Math.round(((last["設計計算書・失敗事例"] ?? 0) / KPI_TARGET) * 100)),
+      "客先の意向": Math.min(100, Math.round(((last["客先の意向"] ?? 0) / KPI_TARGET) * 100)),
+      "トレンド": Math.min(100, Math.round(((last["トレンド"] ?? 0) / KPI_TARGET) * 100)),
+    };
+  }, [layerGrowth]);
+
+  const timelineBySource = useMemo(() => {
+    return sourcesByDate.map(s => {
+      const nodes = NODES.filter(n => parseSource(n.source).date === s.date && parseSource(n.source).name === s.name);
+      return { date: s.date, name: s.name, nodes };
+    });
+  }, [sourcesByDate]);
+
+  return (
+    <div className="p-4 space-y-6">
+      <div className="flex gap-4 flex-wrap">
+        <div className="flex-1 min-w-[300px] bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">累積成長（4層エリア）</h3>
+          <ResponsiveContainer width="100%" height={320}>
+            <AreaChart data={layerGrowth} margin={{ top: 8, right: 8, left: 8, bottom: 24 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={colors.border} />
+              <XAxis dataKey="date" tick={{ fill: colors.textSecondary, fontSize: 10 }} />
+              <YAxis tick={{ fill: colors.textSecondary, fontSize: 10 }} />
+              <Tooltip
+                content={({ active, payload, label }) => {
+                  if (!active || !payload?.length) return null;
+                  const item = layerGrowth.find(d => d.date === label);
+                  return (
+                    <div className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1.5 text-[12px]">
+                      <div className="text-[#F1F5F9] font-medium">{item?.sourceName} ({label})</div>
+                      {payload.map(p => <div key={p.name} style={{ color: p.color }}>{p.name}: {p.value}件</div>)}
+                    </div>
+                  );
+                }}
+              />
+              {LAYER_NAMES.map((name, idx) => (
+                <Area key={name} type="monotone" dataKey={name} stackId="1" stroke={LAYER_COLORS_TAB4[idx]} fill={LAYER_COLORS_TAB4[idx]} fillOpacity={0.7} />
+              ))}
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="w-56 bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+          <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">4層カバレッジ</h3>
+          <div className="space-y-3 text-[13px]">
+            {LAYER_NAMES.map((name, i) => {
+              const pct = coveragePct[name];
+              const isWeak = (name === "客先の意向" || name === "トレンド") && pct < 30;
+              return (
+                <div key={name}>
+                  <div className="flex justify-between mb-0.5">
+                    <span className={isWeak ? "text-red-400" : ""}>{name}{(["客先の意向", "トレンド"].includes(name) ? " ★" : "")}</span>
+                    <span className={isWeak ? "text-red-400" : ""}>{pct}%</span>
+                  </div>
+                  <div className="h-2 bg-[#334155] rounded overflow-hidden">
+                    <div className="h-full rounded transition-all" style={{ width: `${pct}%`, backgroundColor: LAYER_COLORS_TAB4[i] }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+        <h3 className="text-[#F1F5F9] font-semibold mb-3 text-[14px]">会議別 新規追加ナレッジ（タイムライン）</h3>
+        <div className="overflow-y-auto max-h-[420px] space-y-4">
+          {timelineBySource.map(({ date, name, nodes }) => (
+            <div key={`${date}-${name}`} className="flex gap-4">
+              <div className="flex-shrink-0 w-32 text-[12px] text-[#94A3B8] pt-1">
+                {date}<br />{name}
+              </div>
+              <div className="flex-1 space-y-2 border-l-2 border-[#334155] pl-4">
+                {nodes.map(n => (
+                  <div key={n.id} className="flex flex-wrap items-center gap-2 p-2 rounded bg-[#0F172A] border border-[#334155]">
+                    <span className="px-1.5 py-0.5 rounded text-white text-xs" style={{ backgroundColor: perspectiveColors[n.perspective] }}>{n.perspective}</span>
+                    <span className="text-[13px] text-[#F1F5F9]">{n.title}</span>
+                    <div className="flex flex-wrap gap-1">
+                      {n.customerLayers.map(l => (
+                        <span key={l} className="px-1.5 py-0.5 rounded text-[10px] text-white" style={{ backgroundColor: layerColors[l] }}>{l}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ========== タブ5: 関係マトリクス ==========
+const pairMeanings: Record<string, string> = {
+  "④→⑤": "④設計思想が⑤絶対注意の「なぜ守るべきか」の根拠。DRチェックリストで⑤の項目に④の根拠を付記すると、後任設計者の理解が深まる。",
+  "③→⑤": "③技術的注意点が⑤の技術的前提。FMEAの故障モード列挙時に、③のメカニズムから故障モードを連想できる。",
+  "①→⑨": "①判断ルールの変更が⑨影響範囲に波及する。DRで設計変更があった場合、この関係をたどって影響範囲を即座に特定できる。",
+  "⑧→①": "⑧再発防止の過去教訓が①判断ルールの対策として機能。FMEAの対策欄に⑧の教訓を記述し、①のルール化まで対策チェーンを記載する。",
+  "②→⑤": "②社内ルールの手続きが⑤絶対注意の実効性を担保。DRで⑤の確認だけでなく、②の手続きが実施されているかも合わせて確認。",
+  "①→⑦": "①判断ルールの前提から⑦検討漏れが発見された。FMEAの検出度(D)評価で、⑦の存在はD=高のシグナル。",
+  "①→⑤": "①判断ルールが⑤絶対注意の前提。設計判断の根拠を⑤に紐付けるとDRで確認しやすい。",
+  "②→①": "②社内ルールが①判断ルールの手続き的裏付け。",
+  "⑧→⑤": "⑧再発防止の教訓が⑤絶対注意として定型化。",
+  "⑨→⑤": "⑨影響範囲の把握が⑤絶対注意の対策範囲の前提。",
+};
+
+function RelationMatrixTab({
+  selectedCell,
+  setSelectedCell,
+  onHighlightNodes,
+  onSwitchToGraph,
+}: {
+  selectedCell: MatrixCell | null;
+  setSelectedCell: (c: MatrixCell | null) => void;
+  onHighlightNodes: (ids: string[]) => void;
+  onSwitchToGraph: () => void;
+}) {
+  const matrix = useMemo(() => {
+    return PERSPECTIVES.map(fromP =>
+      PERSPECTIVES.map(toP => {
+        const matchingEdges = EDGES.filter(e => {
+          const fromNode = NODES.find(n => n.id === e.from);
+          const toNode = NODES.find(n => n.id === e.to);
+          return fromNode?.perspective === fromP && toNode?.perspective === toP;
+        });
+        const types = REL_TYPES.map(t => ({ type: t, count: matchingEdges.filter(e => e.type === t).length })).filter(x => x.count > 0);
+        return {
+          from: fromP,
+          to: toP,
+          count: matchingEdges.length,
+          types,
+          edges: matchingEdges,
+        } as MatrixCell;
+      })
+    );
+  }, []);
+
+  const relTypeCounts = useMemo(() => {
+    const m: Record<string, number> = {};
+    EDGES.forEach(e => { m[e.type] = (m[e.type] ?? 0) + 1; });
+    return REL_TYPES.map(t => ({ name: t, value: m[t] ?? 0 }));
+  }, []);
+
+  const getCellColor = (cell: MatrixCell) => {
+    if (cell.count === 0) return colors.bg;
+    const top = cell.types.reduce((a, b) => (b.count > a.count ? b : a), { type: "前提", count: 0 });
+    return edgeStyles[top.type as keyof typeof edgeStyles]?.color ?? colors.surface;
+  };
+
+  const short = (p: string) => p.replace(/[①②③④⑤⑥⑦⑧⑨]/g, "");
+
+  return (
+    <div className="p-4 space-y-4">
+      <div className="flex gap-4 flex-wrap">
+        <div className="flex-1 min-w-0 overflow-x-auto">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">観点 × 観点 関係マトリクス（クリックで詳細）</h3>
+          <div className="inline-block border border-[#334155] rounded overflow-hidden">
+            <table className="text-[11px] border-collapse">
+              <thead>
+                <tr>
+                  <th className="p-1 bg-[#334155] text-[#94A3B8] w-14">From \ To</th>
+                  {PERSPECTIVES.map(p => <th key={p} className="p-1 bg-[#334155] text-[#94A3B8] w-10">{short(p)}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {matrix.map((row) => (
+                  <tr key={row[0].from}>
+                    <td className="p-1 bg-[#334155] text-[#94A3B8] font-medium">{short(row[0].from)}</td>
+                    {row.map((cell, ci) => (
+                      <td key={ci} className="p-0">
+                        <button
+                          type="button"
+                          className="w-10 h-8 block border border-[#334155] transition-opacity hover:opacity-90"
+                          style={{ backgroundColor: getCellColor(cell), color: cell.count > 0 ? "#0F172A" : colors.textMuted }}
+                          onClick={() => setSelectedCell(cell.count > 0 ? cell : null)}
+                          title={cell.count > 0 ? `${cell.from} → ${cell.to}: ${cell.count}件` : ""}
+                        >
+                          {cell.count > 0 ? cell.count : "-"}
+                        </button>
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="w-48 bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+          <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">関係種別</h3>
+          <ResponsiveContainer width="100%" height={160}>
+            <PieChart>
+              <Pie
+                data={relTypeCounts}
+                cx="50%"
+                cy="50%"
+                innerRadius={40}
+                outerRadius={60}
+                paddingAngle={2}
+                dataKey="value"
+                nameKey="name"
+                label={({ name, value }) => `${name} ${value}`}
+              >
+                {relTypeCounts.map((entry, i) => (
+                  <Cell key={i} fill={edgeStyles[entry.name as keyof typeof edgeStyles].color} />
+                ))}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+          <p className="text-[11px] text-[#94A3B8] mt-1">現在は「前提」が多数。VTT追加で波及・因果が増加見込み。</p>
+        </div>
+      </div>
+
+      {selectedCell && selectedCell.count > 0 && (
+        <div className="flex gap-4 flex-wrap">
+          <div className="flex-1 min-w-[300px] bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+            <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">選択: {selectedCell.from} → {selectedCell.to}（{selectedCell.types.map(t => `${t.type}×${t.count}`).join(", ")}）</h3>
+            <ul className="space-y-2 text-[13px]">
+              {selectedCell.edges.map((e, i) => {
+                const fromNode = NODES.find(n => n.id === e.from)!;
+                const toNode = NODES.find(n => n.id === e.to)!;
+                return (
+                  <li key={`${e.from}-${e.to}-${i}`} className="flex flex-col gap-1 p-2 rounded bg-[#0F172A] border border-[#334155]">
+                    <div>
+                      <button type="button" onClick={() => { onHighlightNodes([fromNode.id, toNode.id]); onSwitchToGraph(); }} className="text-[#60A5FA] hover:underline text-left">
+                        {fromNode.perspective}「{fromNode.title}」
+                      </button>
+                      <span className="mx-1 text-[#94A3B8]">→【{e.type}】→</span>
+                      <button type="button" onClick={() => { onHighlightNodes([fromNode.id, toNode.id]); onSwitchToGraph(); }} className="text-[#60A5FA] hover:underline text-left">
+                        {toNode.perspective}「{toNode.title}」
+                      </button>
+                    </div>
+                    <div className="text-[#94A3B8] text-[12px]">説明: {e.description}</div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+          <div className="w-72 bg-[#1E293B] border border-[#334155] rounded-lg p-4">
+            <h3 className="text-[#F1F5F9] font-semibold mb-2 text-[14px]">DR/FMEAでの意味</h3>
+            <p className="text-[13px] text-[#94A3B8] leading-relaxed">
+              {pairMeanings[`${selectedCell.from.slice(0, 1)}→${selectedCell.to.slice(0, 1)}`] ?? pairMeanings[`${short(selectedCell.from)}→${short(selectedCell.to)}`] ?? "この観点ペアの関係は、DRでは設計判断の根拠確認、FMEAでは故障モード・対策の連鎖確認に活用できる。"}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ========== App ==========
+const defaultDashboardFilters: DashboardFilters = {
+  product: "全て",
+  domain: "全て",
+  source: "全て",
+  dateRange: { from: "2025-07", to: "2026-01" },
+  perspective: "全て",
+};
+
 export default function App() {
-  const [tab, setTab] = useState<"graph" | "ontology" | "stats">("graph");
+  const [tab, setTab] = useState<1 | 2 | 3 | 4 | 5>(1);
   const [filterPerspectives, setFilterPerspectives] = useState<Set<Perspective>>(new Set());
   const [filterDomain, setFilterDomain] = useState("全て");
   const [filterProduct, setFilterProduct] = useState("全て");
   const [filterRelTypes, setFilterRelTypes] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>(defaultDashboardFilters);
+  const [highlightedNodeIds, setHighlightedNodeIds] = useState<string[]>([]);
+  const [selectedMatrixCell, setSelectedMatrixCell] = useState<MatrixCell | null>(null);
+  const [timeSliderMax, setTimeSliderMax] = useState("2026-01");
+
+  const switchToGraphWithHighlight = (ids: string[]) => {
+    setHighlightedNodeIds(ids);
+    setTab(1);
+  };
 
   return (
     <div className="min-h-screen bg-[#0F172A] text-[#F1F5F9] flex flex-col">
@@ -765,8 +1318,8 @@ export default function App() {
         <h1 className="text-[18px] font-semibold text-white">TICO エレクトロニクス技術部 ナレッジグラフ PoC</h1>
         <p className="text-[14px] text-[#94A3B8] mt-1">会議VTT 8件 → 45ナレッジ × 21関係 を自動抽出</p>
       </header>
-      <nav className="flex border-b border-[#334155] px-6 gap-6">
-        {(["graph", "ontology", "stats"] as const).map(t => (
+      <nav className="flex border-b border-[#334155] px-6 gap-4 flex-wrap">
+        {([1, 2, 3, 4, 5] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -776,14 +1329,16 @@ export default function App() {
               color: tab === t ? colors.textPrimary : colors.textSecondary,
             }}
           >
-            {t === "graph" && "ナレッジグラフ"}
-            {t === "ontology" && "御社オントロジーとの対応"}
-            {t === "stats" && "抽出統計"}
+            {t === 1 && "ナレッジグラフ"}
+            {t === 2 && "御社オントロジーとの対応"}
+            {t === 3 && "集計ダッシュボード"}
+            {t === 4 && "蓄積トレンド"}
+            {t === 5 && "関係マトリクス"}
           </button>
         ))}
       </nav>
       <main className="flex-1 min-h-0 overflow-auto min-h-[60vh]">
-        {tab === "graph" && (
+        {tab === 1 && (
           <KnowledgeGraphTab
             filterPerspectives={filterPerspectives}
             filterDomain={filterDomain}
@@ -795,10 +1350,29 @@ export default function App() {
             setFilterRelTypes={setFilterRelTypes}
             selectedId={selectedId}
             onSelectNode={setSelectedId}
+            timeSliderMax={timeSliderMax}
+            setTimeSliderMax={setTimeSliderMax}
+            highlightedNodeIds={highlightedNodeIds}
+            setHighlightedNodeIds={setHighlightedNodeIds}
           />
         )}
-        {tab === "ontology" && <OntologyMappingTab />}
-        {tab === "stats" && <StatsTab />}
+        {tab === 2 && <OntologyMappingTab />}
+        {tab === 3 && (
+          <DashboardTab
+            filters={dashboardFilters}
+            setFilters={setDashboardFilters}
+            onHeatmapCellClick={switchToGraphWithHighlight}
+          />
+        )}
+        {tab === 4 && <AccumulationTrendTab />}
+        {tab === 5 && (
+          <RelationMatrixTab
+            selectedCell={selectedMatrixCell}
+            setSelectedCell={setSelectedMatrixCell}
+            onHighlightNodes={switchToGraphWithHighlight}
+            onSwitchToGraph={() => setTab(1)}
+          />
+        )}
       </main>
     </div>
   );
