@@ -186,10 +186,14 @@ function KnowledgeGraphTab({
   filterPerspectives,
   filterDomain,
   filterProduct,
+  filterCustomer,
+  filterPhase,
   filterRelTypes,
   setFilterPerspectives,
   setFilterDomain,
   setFilterProduct,
+  setFilterCustomer,
+  setFilterPhase,
   setFilterRelTypes,
   selectedId,
   onSelectNode,
@@ -203,10 +207,14 @@ function KnowledgeGraphTab({
   filterPerspectives: Set<Perspective>;
   filterDomain: string;
   filterProduct: string;
+  filterCustomer: string;
+  filterPhase: string;
   filterRelTypes: Set<string>;
   setFilterPerspectives: (s: Set<Perspective>) => void;
   setFilterDomain: (s: string) => void;
   setFilterProduct: (s: string) => void;
+  setFilterCustomer: (s: string) => void;
+  setFilterPhase: (s: string) => void;
   setFilterRelTypes: (s: Set<string>) => void;
   selectedId: string | null;
   onSelectNode: (id: string | null) => void;
@@ -222,11 +230,28 @@ function KnowledgeGraphTab({
   type D3Node = d3.SimulationNodeDatum & { id: string; radius: number; perspective: Perspective; domain: TechDomain; title: string; customerLayers: CustomerLayer[] };
   type D3Link = d3.SimulationLinkDatum<D3Node> & { type: "因果" | "前提" | "波及" | "対策"; source: D3Node; target: D3Node };
 
+  const customerOptions = useMemo(
+    () => ["全て", ...[...new Set(nodes.map((n) => n.customer).filter(Boolean))].sort()],
+    [nodes]
+  );
+  const phaseOptions = useMemo(() => {
+    const raw = [...new Set(nodes.map((n) => n.phase).filter(Boolean))] as string[];
+    const normalized = raw.map((v) =>
+      /^[0-9a-fA-F-]{36}$/.test(v) ? "その他" : v
+    );
+    const set = new Set(normalized);
+    // 明示的に「共通」を選択肢に含める
+    set.add("共通");
+    return ["全て", ...[...set].sort()];
+  }, [nodes]);
+
   const filtered = useMemo(() => {
     const nodeIds = new Set(nodes.filter(n => {
       if (filterPerspectives.size && !filterPerspectives.has(n.perspective)) return false;
       if (filterDomain !== "全て" && n.domain !== filterDomain) return false;
       if (filterProduct !== "全て" && n.product !== filterProduct) return false;
+      if (filterCustomer !== "全て" && (n.customer ?? "") !== filterCustomer) return false;
+      if (filterPhase !== "全て" && (n.phase ?? "") !== filterPhase) return false;
       if (n.sourceDate && n.sourceDate.slice(0, 7) > timeSliderMax) return false;
       return true;
     }).map(n => n.id));
@@ -239,7 +264,7 @@ function KnowledgeGraphTab({
     filteredEdges.forEach(e => { keepIds.add(e.from); keepIds.add(e.to); });
     const filteredNodes = nodes.filter(n => keepIds.has(n.id));
     return { nodes: filteredNodes, edges: filteredEdges };
-  }, [nodes, edges, filterPerspectives, filterDomain, filterProduct, filterRelTypes, timeSliderMax]);
+  }, [nodes, edges, filterPerspectives, filterDomain, filterProduct, filterCustomer, filterPhase, filterRelTypes, timeSliderMax]);
 
   const degree = useMemo(() => {
     const d: Record<string, number> = {};
@@ -417,6 +442,14 @@ function KnowledgeGraphTab({
         <select value={filterProduct} onChange={e => setFilterProduct(e.target.value)} className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
           {PRODUCTS.map(p => <option key={p} value={p}>{p}</option>)}
         </select>
+        <span className="text-[#94A3B8] text-[13px] ml-2">顧客:</span>
+        <select value={filterCustomer} onChange={e => setFilterCustomer(e.target.value)} className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          {customerOptions.map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <span className="text-[#94A3B8] text-[13px] ml-2">フェーズ:</span>
+        <select value={filterPhase} onChange={e => setFilterPhase(e.target.value)} className="bg-[#1E293B] border border-[#334155] rounded px-2 py-1 text-[13px] text-[#F1F5F9]">
+          {phaseOptions.map(ph => <option key={ph} value={ph}>{ph}</option>)}
+        </select>
         <span className="text-[#94A3B8] text-[13px] ml-2">関係:</span>
         {REL_TYPES.map(t => (
           <button
@@ -436,7 +469,7 @@ function KnowledgeGraphTab({
             {t}
           </button>
         ))}
-        <span className="text-[#94A3B8] text-[13px] ml-4">時間軸:</span>
+        <span className="text-[#94A3B8] text-[13px] ml-4">会議:</span>
         <select
           value={timeSliderMax}
           onChange={e => setTimeSliderMax(e.target.value)}
@@ -1211,313 +1244,6 @@ function RelationMatrixTab({
   );
 }
 
-// ========== タブ6: 製品・顧客別グラフ ==========
-type ProductGraphData = {
-  product: string;
-  nodes: KnowledgeNode[];
-  edges: RelationshipEdge[];
-  density: number;
-  centralNode: KnowledgeNode | null;
-  perspectiveDist: { perspective: string; count: number }[];
-  relationTypeDist: { type: string; count: number }[];
-};
-
-type SourceGraphData = {
-  source: string;
-  sourceName: string;
-  sourceDate: string;
-  nodes: KnowledgeNode[];
-  edges: RelationshipEdge[];
-  nodeCount: number;
-  edgeCount: number;
-};
-
-type CrossProductBridge = {
-  fromProduct: string;
-  fromNodeId: string;
-  toProduct: string;
-  toNodeId: string;
-  edgeType: "因果" | "前提" | "波及" | "対策";
-  edgeDescription: string;
-};
-
-function generateProductInsight(graph: ProductGraphData): string {
-  if (graph.edges.length === 0) {
-    return `${graph.nodes.length}件のナレッジがあるが関係は0件。個別ルールの集合であり、今後のVTT追加でルール間の関係構造が現れる可能性がある。`;
-  }
-  const mainRelType = graph.relationTypeDist[0];
-  const centralTitle = graph.centralNode?.title?.slice(0, 20) ?? "";
-  if (graph.density >= 0.3) {
-    return `密度${graph.density}と高密度。少数のナレッジが密に結合しており、1つの変更が全体に波及する構造。DRでの重点確認対象。`;
-  }
-  return `${mainRelType?.type ?? "関係"}が${mainRelType?.count ?? 0}本で主軸。「${centralTitle}…」が中心ノードとして他の観点を接続。`;
-}
-
-function MiniForceGraph({
-  nodes,
-  edges,
-  width,
-  height,
-  showLabels,
-  nodeRadius = 6,
-  onNodeClick,
-}: {
-  nodes: KnowledgeNode[];
-  edges: RelationshipEdge[];
-  width: number;
-  height: number;
-  showLabels: boolean;
-  nodeRadius?: number;
-  onNodeClick: (nodeId: string) => void;
-}) {
-  const svgRef = useRef<SVGSVGElement>(null);
-
-  useEffect(() => {
-    if (!svgRef.current || nodes.length === 0) return;
-    const nodeIds = new Set(nodes.map((n) => n.id));
-    const validEdges = edges.filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to));
-
-    type D3N = d3.SimulationNodeDatum & { id: string; x?: number; y?: number; perspective: Perspective; title: string };
-    type D3L = d3.SimulationLinkDatum<D3N> & { source: D3N; target: D3N; type: "因果" | "前提" | "波及" | "対策" };
-
-    const degree: Record<string, number> = {};
-    nodes.forEach(n => { degree[n.id] = 0; });
-    validEdges.forEach(e => { degree[e.from] = (degree[e.from] ?? 0) + 1; degree[e.to] = (degree[e.to] ?? 0) + 1; });
-    const maxDeg = Math.max(...Object.values(degree), 1);
-    const rScale = d3.scaleLinear().domain([0, maxDeg]).range([nodeRadius * 0.8, nodeRadius]).clamp(true);
-
-    const d3Nodes: D3N[] = nodes.map(n => ({
-      id: n.id,
-      x: width / 2 + (Math.random() - 0.5) * width * 0.5,
-      y: height / 2 + (Math.random() - 0.5) * height * 0.5,
-      perspective: n.perspective,
-      title: n.title,
-    }));
-    const idToNode = new Map(d3Nodes.map(n => [n.id, n]));
-    const d3Links: D3L[] = validEdges.map(e => ({
-      source: idToNode.get(e.from)!,
-      target: idToNode.get(e.to)!,
-      type: e.type,
-    })).filter(l => l.source && l.target);
-
-    const sim = d3.forceSimulation<D3N>(d3Nodes)
-      .force("link", d3.forceLink<D3N, D3L>(d3Links).id((d: D3N) => d.id).distance(40).strength(0.5))
-      .force("charge", d3.forceManyBody().strength(-80))
-      .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collision", d3.forceCollide<D3N>().radius(nodeRadius + 2).strength(0.8));
-    sim.tick(120);
-
-    const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
-    svg.attr("viewBox", [0, 0, width, height]);
-
-    const g = svg.append("g");
-    const linkG = g.append("g");
-    const nodeG = g.append("g");
-
-    linkG.selectAll("line").data(d3Links).join("line")
-      .attr("stroke", d => edgeStyles[d.type].color)
-      .attr("stroke-width", 1)
-      .attr("stroke-dasharray", d => edgeStyles[d.type].dash ?? "none")
-      .attr("x1", d => (d.source as D3N).x!).attr("y1", d => (d.source as D3N).y!)
-      .attr("x2", d => (d.target as D3N).x!).attr("y2", d => (d.target as D3N).y!);
-
-    const circle = nodeG.selectAll("circle").data(d3Nodes).join("circle")
-      .attr("r", d => rScale(degree[d.id] ?? 0))
-      .attr("fill", d => perspectiveColors[d.perspective])
-      .attr("stroke", colors.border)
-      .attr("stroke-width", 1)
-      .style("cursor", "pointer")
-      .on("click", (_ev, d) => { _ev.stopPropagation(); onNodeClick(d.id); });
-
-    if (showLabels) {
-      nodeG.selectAll("text").data(d3Nodes).join("text")
-        .attr("x", d => d.x!).attr("y", d => d.y!).attr("dy", nodeRadius + 10)
-        .attr("text-anchor", "middle").attr("font-size", 9).attr("fill", colors.textPrimary)
-        .text(d => d.title.length > 12 ? d.title.slice(0, 12) + "…" : d.title)
-        .attr("pointer-events", "none");
-    }
-
-    const ticked = () => {
-      linkG.selectAll<SVGLineElement, D3L>("line")
-        .attr("x1", (d) => (d.source as D3N).x!)
-        .attr("y1", (d) => (d.source as D3N).y!)
-        .attr("x2", (d) => (d.target as D3N).x!)
-        .attr("y2", (d) => (d.target as D3N).y!);
-      circle.attr("cx", (d: D3N) => d.x!).attr("cy", (d: D3N) => d.y!);
-      if (showLabels) nodeG.selectAll<SVGTextElement, D3N>("text").attr("x", (d) => d.x!).attr("y", (d) => d.y!);
-    };
-    sim.on("tick", ticked);
-
-    const tooltip = (ev: MouseEvent, d: D3N) => {
-      const rect = (ev.target as SVGElement).getBoundingClientRect();
-      let tip = document.getElementById("tab6-tooltip");
-      if (!tip) { tip = document.createElement("div"); tip.id = "tab6-tooltip"; document.body.appendChild(tip); }
-      tip.className = "fixed z-50 px-2 py-1.5 rounded text-xs text-left max-w-[240px] border shadow-lg";
-      tip.style.background = colors.surface; tip.style.borderColor = colors.border; tip.style.color = colors.textPrimary;
-      tip.style.left = `${rect.left + rect.width / 2}px`; tip.style.top = `${rect.top}px`; tip.style.transform = "translate(-50%, -100%) translateY(-6px)";
-      tip.innerHTML = `<span class="font-medium" style="color:${perspectiveColors[d.perspective]}">${d.perspective}</span><br/>${d.title}`;
-    };
-    circle.on("mouseover", function(ev, d) { tooltip(ev as unknown as MouseEvent, d); })
-      .on("mouseout", () => { document.getElementById("tab6-tooltip")?.remove(); });
-
-    return () => { sim.stop(); };
-  }, [nodes, edges, width, height, showLabels, nodeRadius, onNodeClick]);
-
-  return <svg ref={svgRef} className="block" style={{ width, height }} />;
-}
-
-function ProductCustomerGraphsTab({ nodes, edges, onNodeClick }: { nodes: KnowledgeNode[]; edges: RelationshipEdge[]; onNodeClick: (nodeIds: string[]) => void }) {
-  const [mode, setMode] = useState<"product" | "source">("product");
-  const [showBridge, setShowBridge] = useState(false);
-  const [hoveredSource, setHoveredSource] = useState<string | null>(null);
-
-  const productGraphs = useMemo((): ProductGraphData[] => {
-    return ["コンバータ", "充電器", "共通"].map((product) => {
-      const pNodes = nodes.filter((n) => n.product === product);
-      const pNodeIds = new Set(pNodes.map((n) => n.id));
-      const pEdges = edges.filter((e) => pNodeIds.has(e.from) && pNodeIds.has(e.to));
-      const density = pNodes.length > 1 ? pEdges.length / (pNodes.length * (pNodes.length - 1) / 2) : 0;
-      const connectionCount = new Map<string, number>();
-      pEdges.forEach(e => {
-        connectionCount.set(e.from, (connectionCount.get(e.from) ?? 0) + 1);
-        connectionCount.set(e.to, (connectionCount.get(e.to) ?? 0) + 1);
-      });
-      const centralId = [...connectionCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-      const centralNode = centralId ? pNodes.find(n => n.id === centralId) ?? null : null;
-      const perspectiveDist = PERSPECTIVES.map(p => ({ perspective: p, count: pNodes.filter(n => n.perspective === p).length })).filter(d => d.count > 0);
-      const relationTypeDist = REL_TYPES.map(t => ({ type: t, count: pEdges.filter(e => e.type === t).length })).filter(d => d.count > 0);
-      return { product, nodes: pNodes, edges: pEdges, density: Math.round(density * 100) / 100, centralNode, perspectiveDist, relationTypeDist };
-    });
-  }, [nodes, edges]);
-
-  const sourceGraphs = useMemo((): SourceGraphData[] => {
-    const sources = [...new Set(nodes.map((n) => n.source))];
-    return sources.map((source) => {
-      const parsed = parseSource(source);
-      const sNodes = nodes.filter((n) => n.source === source);
-      const sNodeIds = new Set(sNodes.map((n) => n.id));
-      const sEdges = edges.filter((e) => sNodeIds.has(e.from) && sNodeIds.has(e.to));
-      return { source, sourceName: parsed.name, sourceDate: parsed.date, nodes: sNodes, edges: sEdges, nodeCount: sNodes.length, edgeCount: sEdges.length };
-    }).sort((a, b) => a.sourceDate.localeCompare(b.sourceDate));
-  }, [nodes, edges]);
-
-  const crossBridges = useMemo((): CrossProductBridge[] => {
-    const list: CrossProductBridge[] = [];
-    edges.forEach((e) => {
-      const fromNode = nodes.find((n) => n.id === e.from);
-      const toNode = nodes.find((n) => n.id === e.to);
-      if (!fromNode || !toNode || fromNode.product === toNode.product) return;
-      list.push({ fromProduct: fromNode.product, fromNodeId: e.from, toProduct: toNode.product, toNodeId: e.to, edgeType: e.type, edgeDescription: e.description });
-    });
-    return list;
-  }, [nodes, edges]);
-
-  const handleNodeClick = (nodeId: string) => {
-    onNodeClick([nodeId]);
-  };
-
-  const productColors: Record<string, string> = { コンバータ: "#3B82F6", 充電器: "#10B981", 共通: "#8B5CF6" };
-
-  return (
-    <div className="p-4 space-y-6">
-      <div className="flex items-center gap-4 flex-wrap">
-        <span className="text-[#94A3B8] text-[13px]">表示:</span>
-        <button type="button" onClick={() => setMode("product")} className="px-3 py-1.5 rounded text-[13px] border transition-colors" style={{ borderColor: colors.border, backgroundColor: mode === "product" ? colors.accent + "40" : colors.surface, color: colors.textPrimary }}>製品別グラフ</button>
-        <button type="button" onClick={() => setMode("source")} className="px-3 py-1.5 rounded text-[13px] border transition-colors" style={{ borderColor: colors.border, backgroundColor: mode === "source" ? colors.accent + "40" : colors.surface, color: colors.textPrimary }}>顧客別グラフ</button>
-        {mode === "product" && (
-          <label className="flex items-center gap-2 text-[13px] text-[#94A3B8]">
-            <input type="checkbox" checked={showBridge} onChange={e => setShowBridge(e.target.checked)} className="rounded" />
-            製品間のつながりを表示
-          </label>
-        )}
-      </div>
-
-      {mode === "product" && (
-        <div className="space-y-4">
-          <h3 className="text-[#F1F5F9] font-semibold text-[14px]">製品別グラフ（ノードクリックでタブ1でハイライト）</h3>
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {productGraphs.map(g => (
-              <div key={g.product} className="bg-[#1E293B] border border-[#334155] rounded-lg overflow-hidden" style={{ minWidth: 280 }}>
-                <div className="px-3 py-2 border-b border-[#334155] text-[#F1F5F9] font-medium text-[14px]" style={{ borderLeft: `4px solid ${productColors[g.product] ?? colors.border}` }}>
-                  {g.product}
-                </div>
-                <div className="p-2 flex justify-center" style={{ height: 320 }}>
-                  <MiniForceGraph nodes={g.nodes} edges={g.edges} width={280} height={300} showLabels={true} onNodeClick={handleNodeClick} />
-                </div>
-                <div className="px-3 py-2 border-t border-[#334155] bg-[#0F172A] text-[12px] space-y-1">
-                  <div className="text-[#94A3B8]">{g.nodes.length}件 / {g.edges.length}関係　密度 {g.density}</div>
-                  <div className="text-[#F1F5F9]">中心: {g.centralNode ? `${g.centralNode.perspective} ${g.centralNode.title.slice(0, 18)}…` : "—"}</div>
-                  <div className="flex flex-wrap gap-1">
-                    {g.perspectiveDist.map(d => (
-                      <span key={d.perspective} className="inline-block" style={{ width: `${Math.max(2, d.count * 4)}px`, height: 8, backgroundColor: perspectiveColors[d.perspective as Perspective], borderRadius: 2 }} title={`${d.perspective} ${d.count}`} />
-                    ))}
-                  </div>
-                  <div className="text-[#64748B]">{g.relationTypeDist.map(d => `${d.type}×${d.count}`).join("　")}</div>
-                  <p className="text-[#94A3B8] leading-snug mt-1">{generateProductInsight(g)}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-          {showBridge && crossBridges.length > 0 && (
-            <div className="bg-[#1E293B] border border-[#334155] rounded-lg p-3">
-              <h4 className="text-[#F1F5F9] text-[13px] mb-2">製品間のつながり（共通ノードを介した関係）</h4>
-              <ul className="text-[12px] text-[#94A3B8] space-y-1">
-                {crossBridges.map((b, i) => {
-                  const fromN = nodes.find((n) => n.id === b.fromNodeId);
-                  const toN = nodes.find((n) => n.id === b.toNodeId);
-                  return (
-                    <li key={i}>
-                      <span style={{ color: productColors[b.fromProduct] }}>{b.fromProduct}</span> {fromN?.title.slice(0, 15)}… →【{b.edgeType}】→ <span style={{ color: productColors[b.toProduct] }}>{b.toProduct}</span> {toN?.title.slice(0, 15)}…
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
-
-      {mode === "source" && (
-        <div className="space-y-4">
-          <h3 className="text-[#F1F5F9] font-semibold text-[14px]">顧客（会議）別グラフ（ホバーで拡大・クリックでタブ1）</h3>
-          <div className="overflow-x-auto pb-2 flex gap-4" style={{ scrollbarWidth: "thin" }}>
-            {sourceGraphs.map(s => (
-              <div
-                key={s.source}
-                className="flex-shrink-0 relative rounded-lg border overflow-hidden bg-[#1E293B]"
-                style={{ borderColor: colors.border, width: 250, height: 280 }}
-                onMouseEnter={() => setHoveredSource(s.source)}
-                onMouseLeave={() => setHoveredSource(null)}
-              >
-                <div className="px-2 py-1 border-b border-[#334155] text-[11px] text-[#94A3B8]">{s.sourceDate} {s.sourceName}</div>
-                <div className="p-1" style={{ height: 220 }}>
-                  <MiniForceGraph nodes={s.nodes} edges={s.edges} width={238} height={210} showLabels={false} nodeRadius={5} onNodeClick={handleNodeClick} />
-                </div>
-                <div className="px-2 py-1 border-t border-[#334155] text-[11px] text-[#64748B]">{s.nodeCount}件 / {s.edgeCount}関係</div>
-              </div>
-            ))}
-          </div>
-          {hoveredSource && (() => {
-            const s = sourceGraphs.find(x => x.source === hoveredSource);
-            if (!s) return null;
-            return (
-              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm" onClick={() => setHoveredSource(null)}>
-                <div className="bg-[#1E293B] border-2 border-[#334155] rounded-lg shadow-xl overflow-hidden" style={{ width: 500, height: 500 }} onClick={e => e.stopPropagation()}>
-                  <div className="px-3 py-2 border-b border-[#334155] text-[#F1F5F9] font-medium">{s.sourceDate} {s.sourceName}</div>
-                  <div className="p-2" style={{ height: 452 }}>
-                    <MiniForceGraph nodes={s.nodes} edges={s.edges} width={484} height={440} showLabels={true} nodeRadius={8} onNodeClick={id => { handleNodeClick(id); setHoveredSource(null); }} />
-                  </div>
-                </div>
-              </div>
-            );
-          })()}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ========== App ==========
 const defaultDashboardFilters: DashboardFilters = {
   product: "全て",
@@ -1574,10 +1300,12 @@ function DataSourceIndicator({
 
 export default function App() {
   const { nodes, edges, isLoading, isLive, error, refetch, lastUpdated } = useKnowledgeData();
-  const [tab, setTab] = useState<1 | 2 | 3 | 4 | 5 | 6>(1);
+  const [tab, setTab] = useState<1 | 2 | 3 | 4 | 5>(1);
   const [filterPerspectives, setFilterPerspectives] = useState<Set<Perspective>>(new Set());
   const [filterDomain, setFilterDomain] = useState("全て");
   const [filterProduct, setFilterProduct] = useState("全て");
+  const [filterCustomer, setFilterCustomer] = useState("全て");
+  const [filterPhase, setFilterPhase] = useState("全て");
   const [filterRelTypes, setFilterRelTypes] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>(defaultDashboardFilters);
@@ -1605,7 +1333,7 @@ export default function App() {
         <DataSourceIndicator isLive={isLive} isLoading={isLoading} error={error} lastUpdated={lastUpdated} onRefetch={refetch} />
       </header>
       <nav className="flex border-b border-[#334155] px-6 gap-4 flex-wrap">
-        {([1, 2, 3, 4, 5, 6] as const).map(t => (
+        {([1, 2, 3, 4, 5] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -1620,7 +1348,6 @@ export default function App() {
             {t === 3 && "集計ダッシュボード"}
             {t === 4 && "蓄積トレンド"}
             {t === 5 && "関係マトリクス"}
-            {t === 6 && "製品・顧客別グラフ"}
           </button>
         ))}
       </nav>
@@ -1633,10 +1360,14 @@ export default function App() {
             filterPerspectives={filterPerspectives}
             filterDomain={filterDomain}
             filterProduct={filterProduct}
+            filterCustomer={filterCustomer}
+            filterPhase={filterPhase}
             filterRelTypes={filterRelTypes}
             setFilterPerspectives={setFilterPerspectives}
             setFilterDomain={setFilterDomain}
             setFilterProduct={setFilterProduct}
+            setFilterCustomer={setFilterCustomer}
+            setFilterPhase={setFilterPhase}
             setFilterRelTypes={setFilterRelTypes}
             selectedId={selectedId}
             onSelectNode={setSelectedId}
@@ -1666,7 +1397,6 @@ export default function App() {
             onSwitchToGraph={() => setTab(1)}
           />
         )}
-        {tab === 6 && <ProductCustomerGraphsTab nodes={nodes} edges={edges} onNodeClick={switchToGraphWithHighlight} />}
         </ErrorBoundary>
       </main>
     </div>
